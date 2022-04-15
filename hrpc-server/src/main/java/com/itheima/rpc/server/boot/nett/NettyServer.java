@@ -16,6 +16,7 @@ import io.netty.handler.logging.LogLevel;
 import io.netty.handler.logging.LoggingHandler;
 import io.netty.util.NettyRuntime;
 import io.netty.util.concurrent.DefaultThreadFactory;
+import io.netty.util.concurrent.EventExecutorGroup;
 import io.netty.util.concurrent.UnorderedThreadPoolEventExecutor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -35,39 +36,37 @@ public class NettyServer implements RpcServer {
     public void start() {
         EventLoopGroup boss = new NioEventLoopGroup(1,new DefaultThreadFactory("boss"));
         EventLoopGroup worker = new NioEventLoopGroup(0,new DefaultThreadFactory("worker"));
-        UnorderedThreadPoolEventExecutor business =new UnorderedThreadPoolEventExecutor(NettyRuntime.availableProcessors() * 2, new DefaultThreadFactory("business"));
+        EventExecutorGroup business = new UnorderedThreadPoolEventExecutor(NettyRuntime.availableProcessors()*2,new DefaultThreadFactory("business"));
         try {
             ServerBootstrap serverBootstrap = new ServerBootstrap();
             serverBootstrap.group(boss,worker)
                     .channel(NioServerSocketChannel.class)
-                    .handler(new LoggingHandler(LogLevel.INFO))
                     .option(ChannelOption.SO_BACKLOG,1024)
                     .childOption(ChannelOption.TCP_NODELAY,true)
                     .childOption(ChannelOption.SO_KEEPALIVE,true)
+                    .handler(new LoggingHandler(LogLevel.INFO))
                     .childHandler(new ChannelInitializer<SocketChannel>() {
                         @Override
                         protected void initChannel(SocketChannel ch) throws Exception {
                             ChannelPipeline pipeline = ch.pipeline();
-                            pipeline.addLast("logHandler",new LoggingHandler(LogLevel.INFO));
-                            pipeline.addLast("FrameEncoder",new FrameEncoder());
-                            pipeline.addLast("RpcResponseEncoder",new RpcResponseEncoder());
-
-                            pipeline.addLast("FrameDecoder",new FrameDecoder());
-                            pipeline.addLast("RpcRequestDecoder",new RpcRequestDecoder());
-                            pipeline.addLast(business,"RpcRequestHandler",rpcRequestHandler);
+                            //编码
+                            pipeline.addLast("frameEncoder",new FrameEncoder());
+                            pipeline.addLast("responseEncoder",new RpcResponseEncoder());
+                            // 解码
+                            pipeline.addLast("frameDecoder",new FrameDecoder());
+                            pipeline.addLast("requestDecoder",new RpcRequestDecoder());
+                            pipeline.addLast(business,"rpcRequestHandler",new RpcRequestHandler());
                         }
                     });
-            //绑定端口启动
             ChannelFuture future = serverBootstrap.bind(rpcServerConfiguration.getRpcPort()).sync();
-            //阻塞等待服务关闭
+            log.info("服务端绑定端口{}启动成功",rpcServerConfiguration.getRpcPort());
             future.channel().closeFuture().sync();
-        } catch (Exception e) {
-            log.error("rpc server start error,msg={}",e.getMessage());
-        } finally {
-            //shutdown
-            boss.shutdownGracefully();
-            worker.shutdownGracefully();
+        } catch (InterruptedException e) {
+            log.error("服务端出现异常,msg={}",e.getMessage());
+        }finally {
             business.shutdownGracefully();
+            worker.shutdownGracefully();
+            boss.shutdownGracefully();
         }
     }
 }

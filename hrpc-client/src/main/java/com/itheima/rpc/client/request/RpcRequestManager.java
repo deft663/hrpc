@@ -11,6 +11,7 @@ import com.itheima.rpc.netty.codec.FrameEncoder;
 import com.itheima.rpc.netty.codec.RpcRequestEncoder;
 import com.itheima.rpc.netty.codec.RpcResponseDecoder;
 import com.itheima.rpc.netty.handler.RpcResponseHandler;
+import com.itheima.rpc.netty.request.ChannelMapping;
 import com.itheima.rpc.netty.request.RequestPromise;
 import com.itheima.rpc.netty.request.RpcRequestHolder;
 import com.itheima.rpc.provider.ServiceProvider;
@@ -22,15 +23,13 @@ import io.netty.channel.socket.nio.NioSocketChannel;
 import io.netty.handler.logging.LogLevel;
 import io.netty.handler.logging.LoggingHandler;
 import io.netty.util.concurrent.DefaultThreadFactory;
-import io.netty.util.concurrent.Future;
-import io.netty.util.concurrent.FutureListener;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
 import org.springframework.util.CollectionUtils;
 
 import java.util.List;
-import java.util.concurrent.TimeUnit;
+import java.util.concurrent.ExecutionException;
 
 @Slf4j
 @Component
@@ -57,66 +56,61 @@ public class RpcRequestManager {
     }
 
     private RpcResponse requestByNetty(RpcRequest request, ServiceProvider serviceProvider) {
-        EventLoopGroup worker = new NioEventLoopGroup(0, new DefaultThreadFactory("worker"));
-        Bootstrap bootstrap = new Bootstrap();
-        bootstrap.group(worker)
-                .channel(NioSocketChannel.class)
-                .handler(new ChannelInitializer<SocketChannel>() {
-                    @Override
-                    protected void initChannel(SocketChannel ch) throws Exception {
-                        RpcResponseHandler responseHandler = new RpcResponseHandler();//复用
-                        Bootstrap bootstrap = new Bootstrap();
-                        bootstrap.group(worker)
-                                .channel(NioSocketChannel.class)
-                                .handler(new ChannelInitializer<SocketChannel>() {
-                                    @Override
-                                    protected void initChannel(SocketChannel ch) throws Exception {
-                                        ChannelPipeline pipeline = ch.pipeline();
-                                        pipeline.addLast(new LoggingHandler(LogLevel.INFO));
-                                        //添加请求编码器
-                                        pipeline.addLast("FrameEncoder", new FrameEncoder());
-                                        pipeline.addLast("RpcReqeustEncoder", new RpcRequestEncoder());
+        Channel channel =null;
+        //Channel channel1 = RpcRequestHolder.getChannel(serviceProvider.getServerIp(), serviceProvider.getRpcPort());
+        if(!RpcRequestHolder.channelExist(serviceProvider.getServerIp(),serviceProvider.getRpcPort())){
+            try {
+                EventLoopGroup worker = new NioEventLoopGroup(0, new DefaultThreadFactory("worker"));
+                Bootstrap bootstrap = new Bootstrap();
+                bootstrap.group(worker)
+                        .channel(NioSocketChannel.class)
+                        .handler(new ChannelInitializer<SocketChannel>() {
+                            @Override
+                            protected void initChannel(SocketChannel ch) throws Exception {
+                                ChannelPipeline pipeline = ch.pipeline();
+                                pipeline.addLast(new LoggingHandler(LogLevel.INFO));
+                                //添加请求编码器
+                                pipeline.addLast("FrameEncoder", new FrameEncoder());
+                                pipeline.addLast("RpcReqeustEncoder", new RpcRequestEncoder());
 
-                                        pipeline.addLast("FrameDecoder", new FrameDecoder());
-                                        pipeline.addLast("RpcResponseDecoder", new RpcResponseDecoder());
-                                        pipeline.addLast("RpcResponseHandler", responseHandler);
-                                    }
-                                });
-                    }
-                });
+                                pipeline.addLast("FrameDecoder", new FrameDecoder());
+                                pipeline.addLast("RpcResponseDecoder", new RpcResponseDecoder());
+                                pipeline.addLast("RpcResponseHandler", new RpcResponseHandler());
+                            }
+                        });
+                ChannelFuture future = bootstrap.connect(serviceProvider.getServerIp(), serviceProvider.getRpcPort()).sync();
+                //如果连接成功
+                if (future.isSuccess()) {
+                    //连接建立成功
+                    channel = future.channel();
+                    ChannelMapping channelMapping = new ChannelMapping(serviceProvider.getServerIp(), serviceProvider.getRpcPort(), channel);
+                    RpcRequestHolder.addChannelMapping(channelMapping);
+                }
+            } catch (InterruptedException e) {
+                e.printStackTrace();
+            }
+        }
+
         //建立连接
         try {
-            ChannelFuture future = bootstrap.connect(serviceProvider.getServerIp(), serviceProvider.getRpcPort()).sync();
-            //如果连接成功
-            if (future.isSuccess()) {
-                RequestPromise requestPromise = new RequestPromise(future.channel().eventLoop());
-                RpcRequestHolder.addRequestPromise(request.getRequestId(),requestPromise);
-                //向服务端发送数据
-                ChannelFuture channelFuture = future.channel().writeAndFlush(request);
-                //添加发数据结果回调监听
-                channelFuture.addListener(new ChannelFutureListener() {
-                    @Override
-                    public void operationComplete(ChannelFuture future) throws Exception {
-                        //如果没有发送成功,移除requetPromise
-                        if (!future.isSuccess()) {
-                            RpcRequestHolder.removeRequestPromise(request.getRequestId());
-                        }
-                    }
-                });
+            channel = RpcRequestHolder.getChannel(serviceProvider.getServerIp(), serviceProvider.getRpcPort());
 
-                //设置结果回调监听
-                requestPromise.addListener(new FutureListener<RpcResponse>() {
-                    @Override
-                    public void operationComplete(Future<RpcResponse> future) throws Exception {
-                        if (!future.isSuccess()) {
-                            RpcRequestHolder.removeRequestPromise(request.getRequestId());
-                        }
-                    }
-                });
-                //获取返回结果
-                RpcResponse response = (RpcResponse) requestPromise.get(clientConfiguration.getConnectTimeout(), TimeUnit.SECONDS);
-                RpcRequestHolder.removeRequestPromise(request.getRequestId());
+            //向对端发送数据
+            //创建promise
+            RequestPromise requestPromise = new RequestPromise(channel.eventLoop());
+            //建立映射
+            RpcRequestHolder.addRequestPromise(request.getRequestId(),requestPromise);
+            // 发送数据
+            ChannelFuture f = channel.writeAndFlush(request);
+
+            //等待promise返回结果
+            try {
+                RpcResponse response = (RpcResponse) requestPromise.get();
                 return response;
+            } catch (ExecutionException e) {
+                e.printStackTrace();
+            }finally {
+                RpcRequestHolder.removeRequestPromise(request.getRequestId());
             }
         } catch (Exception e) {
             log.error("remote rpc request error,msg={}", e.getCause());
